@@ -2,6 +2,7 @@ mod message_shim;
 mod scheduler;
 use crate::scheduler::Scheduler;
 
+use chrono::Weekday;
 use clap::Parser;
 use dotenv::dotenv;
 use serenity::async_trait;
@@ -15,7 +16,7 @@ use serenity::model::interactions::application_command::{
 use serenity::model::interactions::message_component::MessageComponentInteraction;
 use serenity::model::interactions::{Interaction, InteractionResponseType};
 use serenity::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
@@ -124,6 +125,16 @@ impl Handler {
             Some(weeks) => weeks.as_i64().expect("Weeks has incorrect type"),
             None => MAX_WEEKS as i64,
         };
+        let days = options
+            .get("days")
+            .map(|s| {
+                s.as_str()
+                    .expect("Days has incorrect type")
+                    .split('+')
+                    .map(|d| Weekday::from_str(d).expect("Cannot parse day"))
+                    .collect::<HashSet<Weekday>>()
+            })
+            .unwrap_or_else(|| HashSet::from([Weekday::Sat, Weekday::Sun]));
         let skip = options
             .get("skip")
             .map(|v| v.as_i64().expect("Skip has incorrect type"));
@@ -140,7 +151,8 @@ impl Handler {
             .await
             .expect("Cannot get message");
         let message_id = message.id;
-        let mut scheduler = Scheduler::new(command.user.id, group, message, weeks, skip, title);
+        let mut scheduler =
+            Scheduler::new(command.user.id, group, message, weeks, skip, title, days);
         scheduler.update_message(&ctx).await;
         let mut schedulers = self.schedulers.write().await;
         schedulers.insert(message_id, scheduler);
@@ -338,6 +350,14 @@ impl EventHandler for Handler {
                         .description("weeks before start")
                         .kind(ApplicationCommandOptionType::Integer)
                         .min_int_value(0)
+                })
+                .create_option(|o| {
+                    o.name("days")
+                        .description("weekdays to include")
+                        .kind(ApplicationCommandOptionType::String)
+                        .add_string_choice("Saturday + Sunday", "Sat+Sun")
+                        .add_string_choice("Saturday", "Sat")
+                        .add_string_choice("Sunday", "Sun")
                 })
         })
         .await

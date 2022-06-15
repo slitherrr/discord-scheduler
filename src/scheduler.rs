@@ -38,6 +38,7 @@ impl Scheduler {
         weeks: i64,
         skip: Option<i64>,
         title: &str,
+        days: HashSet<Weekday>,
     ) -> Self {
         let today = Local::today().naive_local();
         let mut start_date = today.succ();
@@ -49,9 +50,7 @@ impl Scheduler {
         }
         let end_date = start_date + Duration::weeks(weeks);
         let window = DateRule::daily(start_date).with_end(end_date);
-        let dates = window
-            .filter(|day| matches!(day.weekday(), Weekday::Sat | Weekday::Sun))
-            .collect();
+        let dates = window.filter(|day| days.contains(&day.weekday())).collect();
         Self {
             owner,
             title: title.to_string(),
