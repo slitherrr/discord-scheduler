@@ -79,7 +79,7 @@ impl Scheduler {
         }
     }
 
-    fn get_results(&self, detailed: bool) -> String {
+    fn get_results(&self, detailed: bool) -> impl Iterator<Item = String> + '_ {
         let results = self.dates.iter().map(|date| {
             let mut users = HashSet::new();
             for (user_id, response) in self.responses.iter() {
@@ -94,35 +94,33 @@ impl Scheduler {
             .map(|(_, users)| users.len())
             .max()
             .unwrap_or(0);
-        results
-            .map(|(date, users)| {
-                let count = users.len();
-                let date = date.format("%a %Y-%m-%d");
-                let mut line = if max > 0 && count == max {
-                    format!("__`{}:`__ {}", date, count)
-                } else {
-                    format!("`{}:` {}", date, count)
-                };
-                if detailed && !users.is_empty() {
-                    line = format!(
-                        "{} - {}",
-                        line,
-                        users
-                            .iter()
-                            .sorted()
-                            .map(|uid| format!("<@{}>", uid))
-                            .join(", ")
-                    );
-                }
-                line
-            })
-            .join("\n")
+        results.map(move |(date, users)| {
+            let count = users.len();
+            let date = date.format("%a %Y-%m-%d");
+            let mut line = if max > 0 && count == max {
+                format!("__`{}:`__ {}", date, count)
+            } else {
+                format!("`{}:` {}", date, count)
+            };
+            if detailed && !users.is_empty() {
+                line = format!(
+                    "{} - {}",
+                    line,
+                    users
+                        .iter()
+                        .sorted()
+                        .map(|uid| format!("<@{}>", uid))
+                        .join(", ")
+                );
+            }
+            line
+        })
     }
 
     pub async fn update_message(&self, ctx: &Context) {
         let title = &self.title;
         let responses = self.get_responses();
-        let results = self.get_results(false);
+        let results = self.get_results(false).join("\n");
         let closed = self.closed;
         let content = match &self.group {
             Some(role) => format!("<@&{}>", role),
@@ -206,15 +204,26 @@ impl Scheduler {
     }
 
     pub async fn show_details(&self, ctx: &Context, component: &MessageComponentInteraction) {
-        component
-            .create_interaction_response(ctx, |r| {
-                r.kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|m| {
-                        m.ephemeral(true).content(self.get_results(true))
-                    })
-            })
-            .await
-            .expect("Cannot send message");
+        component.defer(ctx).await.unwrap();
+        let results = self.get_results(true);
+        let mut messages: Vec<String> = vec![];
+        let mut content = String::new();
+        for line in results {
+            assert!(line.len() < 2000);
+            if content.len() + line.len() >= 2000 {
+                messages.push(content);
+                content = String::new()
+            }
+            content += &line;
+            content.push('\n');
+        }
+        messages.push(content);
+        for content in messages {
+            component
+                .create_followup_message(ctx, |m| m.ephemeral(true).content(content))
+                .await
+                .expect("Cannot send message");
+        }
     }
 
     async fn update_dm(&self, ctx: &Context, component: &MessageComponentInteraction) {
