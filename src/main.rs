@@ -20,40 +20,37 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 
+const DATA_DIR: &str = "data";
 const MAX_WEEKS: usize = 10;
 
 // All mutable accesses to Handler.schedulers go through this wrapper, which dumps the data to disk
 // when it is dropped.
 struct ScheduleWrapper<'a> {
-    handler: &'a Handler,
     message_id: MessageId,
-    schedulers: RwLockWriteGuard<'a, HashMap<MessageId, Scheduler>>,
+    scheduler: RwLockMappedWriteGuard<'a, Scheduler>,
 }
 
 impl<'a> Deref for ScheduleWrapper<'a> {
     type Target = Scheduler;
 
     fn deref(&self) -> &Self::Target {
-        self.schedulers
-            .get(&self.message_id)
-            .expect("Cannot find scheduler")
+        &*self.scheduler
     }
 }
 
 impl<'a> DerefMut for ScheduleWrapper<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.schedulers
-            .get_mut(&self.message_id)
-            .expect("Cannot find scheduler")
+        &mut *self.scheduler
     }
 }
 
 impl<'a> Drop for ScheduleWrapper<'a> {
     fn drop(&mut self) {
-        self.handler.dump(&*self.schedulers);
+        write_file(&self.message_id, self);
     }
 }
 
@@ -73,32 +70,89 @@ async fn send_error(ctx: &Context, command: &ApplicationCommandInteraction, msg:
         .expect("Cannot send error response");
 }
 
+fn read_file(path: &Path) -> Option<(u64, Scheduler)> {
+    let extension = path.extension().and_then(|e| e.to_str());
+    if !matches!(extension, Some("json")) {
+        return None;
+    }
+    let id: u64 = path
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Cannot parse file name");
+    let file = File::open(path).expect("Cannot open file");
+    Some((
+        id,
+        serde_json::from_reader(file).expect("Cannot parse data"),
+    ))
+}
+
+fn file_path(id: &MessageId) -> PathBuf {
+    let mut path: PathBuf = DATA_DIR.into();
+    path.push(id.as_u64().to_string());
+    path.set_extension("json");
+    path
+}
+
+fn write_file(id: &MessageId, scheduler: &Scheduler) {
+    let file = File::create(file_path(id)).expect("Cannot create file");
+    serde_json::to_writer(file, &scheduler).expect("Cannot serialize data");
+}
+
+fn delete_file(id: &MessageId) {
+    std::fs::remove_file(file_path(id)).expect("Cannot delete file");
+}
+
 impl Handler {
     fn new(refresh: bool) -> Self {
-        let schedulers: HashMap<MessageId, Scheduler> = File::open("data.json")
-            .map(|f| {
-                println!("Loading existing data");
-                serde_json::from_reader(f).expect("Cannot parse data")
-            })
-            .unwrap_or_default();
+        let data_dir = std::fs::metadata(DATA_DIR);
+        let is_dir = match data_dir {
+            Ok(f) => f.is_dir(),
+            Err(_) => false,
+        };
+        if !is_dir {
+            std::fs::create_dir(DATA_DIR).expect("Cannot create data dir");
+            if let Ok(f) = File::open("data.json") {
+                println!("Converting old data");
+                let schedulers: HashMap<MessageId, Scheduler> =
+                    serde_json::from_reader(f).expect("Cannot parse data");
+                for (id, s) in schedulers.iter() {
+                    write_file(id, s);
+                }
+            }
+        }
+
+        let mut schedulers: HashMap<MessageId, Scheduler> = HashMap::default();
+        for f in std::fs::read_dir(DATA_DIR).expect("Cannot read data dir") {
+            let path = f.unwrap().path();
+            if let Some((id, s)) = read_file(&path) {
+                schedulers.insert(id.into(), s);
+            }
+        }
+        println!("{} schedulers loaded", schedulers.len());
+
         Handler {
             refresh,
             schedulers: RwLock::new(schedulers),
         }
     }
 
-    fn dump(&self, schedulers: &HashMap<MessageId, Scheduler>) {
-        let file = File::create("data.json").expect("Cannot create file");
-        serde_json::to_writer(file, &schedulers).expect("Cannot serialize data");
+    async fn get_scheduler(
+        &self,
+        message_id: &MessageId,
+    ) -> Option<RwLockReadGuard<'_, Scheduler>> {
+        let schedulers = self.schedulers.read().await;
+        RwLockReadGuard::try_map(schedulers, |s| s.get(message_id)).ok()
     }
 
-    async fn get_scheduler(&self, message_id: MessageId) -> Option<ScheduleWrapper<'_>> {
+    async fn get_mut_scheduler(&self, message_id: MessageId) -> Option<ScheduleWrapper<'_>> {
         let schedulers = self.schedulers.write().await;
-        schedulers.get(&message_id)?;
+        let scheduler = RwLockWriteGuard::try_map(schedulers, |s| s.get_mut(&message_id)).ok()?;
         Some(ScheduleWrapper {
-            handler: self,
             message_id,
-            schedulers,
+            scheduler,
         })
     }
 
@@ -151,18 +205,17 @@ impl Handler {
             .await
             .expect("Cannot get message");
         let message_id = message.id;
-        let mut scheduler =
-            Scheduler::new(command.user.id, group, message, weeks, skip, title, days);
+        let scheduler = Scheduler::new(command.user.id, group, message, weeks, skip, title, days);
         scheduler.update_message(&ctx).await;
         let mut schedulers = self.schedulers.write().await;
+        write_file(&message_id, &scheduler);
         schedulers.insert(message_id, scheduler);
-        self.dump(&schedulers);
     }
 
     async fn handle_add_response(&self, ctx: Context, component: MessageComponentInteraction) {
         let message_id = component.message.id;
         let mut scheduler = self
-            .get_scheduler(message_id)
+            .get_mut_scheduler(message_id)
             .await
             .expect("Cannot find scheduler");
         scheduler.send_dm(&ctx, &component).await;
@@ -170,8 +223,10 @@ impl Handler {
 
     async fn handle_show_details(&self, ctx: Context, component: &MessageComponentInteraction) {
         let message_id = component.message.id;
-        let schedulers = self.schedulers.read().await;
-        let scheduler = schedulers.get(&message_id).expect("Cannot find scheduler");
+        let scheduler = self
+            .get_scheduler(&message_id)
+            .await
+            .expect("Cannot find scheduler");
         scheduler.show_details(&ctx, component).await;
     }
 
@@ -188,15 +243,15 @@ impl Handler {
             .message_id
             .unwrap();
         let mut scheduler = self
-            .get_scheduler(scheduler_message)
+            .get_mut_scheduler(scheduler_message)
             .await
             .expect("Cannot find scheduler");
         scheduler.handle_response(&ctx, component).await;
     }
 
     async fn handle_close(&self, ctx: Context, component: MessageComponentInteraction) {
-        let mut scheduler = self
-            .get_scheduler(component.message.id)
+        let scheduler = self
+            .get_scheduler(&component.message.id)
             .await
             .expect("Cannot find scheduler");
         scheduler.close_prompt(&ctx, component).await;
@@ -209,7 +264,7 @@ impl Handler {
             .expect("Cannot respond to button");
         let message_ref = component.message.message_reference.as_ref().unwrap();
         let mut scheduler = self
-            .get_scheduler(message_ref.message_id.unwrap())
+            .get_mut_scheduler(message_ref.message_id.unwrap())
             .await
             .expect("Cannot find scheduler");
         scheduler.handle_close(&ctx, component).await;
@@ -233,7 +288,7 @@ impl Handler {
             .message_id
             .unwrap();
         let mut scheduler = self
-            .get_scheduler(scheduler_message)
+            .get_mut_scheduler(scheduler_message)
             .await
             .expect("Cannot find scheduler");
         let index = data.parse().expect("Cannot parse index");
@@ -253,7 +308,7 @@ impl Handler {
             .message_id
             .unwrap();
         let mut scheduler = self
-            .get_scheduler(scheduler_message)
+            .get_mut_scheduler(scheduler_message)
             .await
             .expect("Cannot find scheduler");
         scheduler.handle_select_all(&ctx, component).await;
@@ -272,7 +327,7 @@ impl Handler {
             .message_id
             .unwrap();
         let mut scheduler = self
-            .get_scheduler(scheduler_message)
+            .get_mut_scheduler(scheduler_message)
             .await
             .expect("Cannot find scheduler");
         scheduler.handle_clear_all(&ctx, component).await;
@@ -364,7 +419,7 @@ impl EventHandler for Handler {
         .expect("Cannot create command");
 
         if self.refresh {
-            for (_, scheduler) in self.schedulers.write().await.iter_mut() {
+            for (_, scheduler) in self.schedulers.read().await.iter() {
                 scheduler.update_message(&ctx).await;
             }
         }
@@ -381,7 +436,7 @@ impl EventHandler for Handler {
         if let Some(mut scheduler) = schedulers.remove(&deleted_message_id) {
             println!("scheduler message deleted: {}", deleted_message_id);
             scheduler.close(&ctx).await;
-            self.dump(&schedulers);
+            delete_file(&deleted_message_id);
         }
     }
 }

@@ -15,7 +15,7 @@ pub struct MessageShim {
 
 impl MessageShim {
     /// See [`serenity::model::channel::Message::edit`]
-    pub async fn edit<'a, F>(&mut self, cache_http: impl CacheHttp, f: F) -> serenity::Result<()>
+    pub async fn edit<'a, F>(&self, cache_http: impl CacheHttp, f: F) -> serenity::Result<()>
     where
         F: for<'b> FnOnce(&'b mut EditMessage<'a>) -> &'b mut EditMessage<'a>,
     {

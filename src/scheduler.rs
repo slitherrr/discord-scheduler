@@ -119,7 +119,7 @@ impl Scheduler {
             .join("\n")
     }
 
-    pub async fn update_message(&mut self, ctx: &Context) {
+    pub async fn update_message(&self, ctx: &Context) {
         let title = &self.title;
         let responses = self.get_responses();
         let results = self.get_results(false);
@@ -291,7 +291,7 @@ impl Scheduler {
             .unwrap();
     }
 
-    pub async fn close_prompt(&mut self, ctx: &Context, component: MessageComponentInteraction) {
+    pub async fn close_prompt(&self, ctx: &Context, component: MessageComponentInteraction) {
         if component.user.id != self.owner {
             component
                 .create_interaction_response(ctx, |response| {
