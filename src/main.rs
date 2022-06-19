@@ -114,14 +114,6 @@ impl Handler {
         };
         if !is_dir {
             std::fs::create_dir(DATA_DIR).expect("Cannot create data dir");
-            if let Ok(f) = File::open("data.json") {
-                println!("Converting old data");
-                let schedulers: HashMap<MessageId, Scheduler> =
-                    serde_json::from_reader(f).expect("Cannot parse data");
-                for (id, s) in schedulers.iter() {
-                    write_file(id, s);
-                }
-            }
         }
 
         let mut schedulers: HashMap<MessageId, Scheduler> = HashMap::default();
