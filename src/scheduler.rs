@@ -161,6 +161,7 @@ impl Scheduler {
                     })
                     .components(|c| c.add_action_row(ar))
                     .allowed_mentions(|am| am.roles(self.group))
+                    .suppress_embeds(false)
             })
             .await
             .map_err(|e| error!("Cannot edit message: {}", e))
