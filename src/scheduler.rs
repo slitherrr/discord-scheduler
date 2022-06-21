@@ -4,6 +4,7 @@ use crate::MAX_WEEKS;
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use chronoutil::DateRule;
 use itertools::Itertools;
+use log::error;
 use serde::{Deserialize, Serialize};
 use serenity::builder::{CreateActionRow, CreateButton, CreateComponents};
 use serenity::client::Context;
@@ -162,7 +163,7 @@ impl Scheduler {
                     .allowed_mentions(|am| am.roles(self.group))
             })
             .await
-            .map_err(|e| println!("Cannot edit message: {}", e))
+            .map_err(|e| error!("Cannot edit message: {}", e))
             .ok();
     }
 

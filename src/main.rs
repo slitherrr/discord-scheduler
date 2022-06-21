@@ -5,6 +5,7 @@ use crate::scheduler::Scheduler;
 use chrono::Weekday;
 use clap::Parser;
 use dotenv::dotenv;
+use log::{error, info};
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::json::Value;
@@ -20,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
@@ -123,7 +125,7 @@ impl Handler {
                 schedulers.insert(id.into(), s);
             }
         }
-        println!("{} schedulers loaded", schedulers.len());
+        info!("{} schedulers loaded", schedulers.len());
 
         Handler {
             refresh,
@@ -333,7 +335,7 @@ impl EventHandler for Handler {
             Interaction::ApplicationCommand(command) => {
                 let user = command.user.name.as_str();
                 let command_name = command.data.name.as_str();
-                println!("{} <{}>", command_name, user);
+                info!("{} <{}>", command_name, user);
                 match command_name {
                     "schedule" => self.create_scheduler(ctx, command).await,
                     _ => panic!("Unexpected command: {}", command_name),
@@ -342,7 +344,7 @@ impl EventHandler for Handler {
             Interaction::MessageComponent(component) => {
                 let user = component.user.name.as_str();
                 let button_id = component.data.custom_id.as_str();
-                println!("{} <{}>", button_id, user);
+                info!("{} <{}>", button_id, user);
                 match button_id {
                     "response" => self.handle_add_response(ctx, component).await,
                     "details" => self.handle_show_details(ctx, &component).await,
@@ -368,7 +370,7 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, _ready: Ready) {
-        println!("ready");
+        info!("ready");
 
         ApplicationCommand::create_global_application_command(&ctx, |command| {
             command
@@ -419,15 +421,14 @@ impl EventHandler for Handler {
 
     async fn message_delete(
         &self,
-        ctx: Context,
+        _ctx: Context,
         _channel_id: ChannelId,
         deleted_message_id: MessageId,
         _guild_id: Option<GuildId>,
     ) {
         let mut schedulers = self.schedulers.write().await;
-        if let Some(mut scheduler) = schedulers.remove(&deleted_message_id) {
-            println!("scheduler message deleted: {}", deleted_message_id);
-            scheduler.close(&ctx).await;
+        if let Some(_scheduler) = schedulers.remove(&deleted_message_id) {
+            info!("scheduler message deleted: {}", deleted_message_id);
             delete_file(&deleted_message_id);
         }
     }
@@ -442,6 +443,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::new()
+        .target(env_logger::Target::Stdout)
+        .filter(Some("scheduler"), log::LevelFilter::Info)
+        .init();
     let cli = Cli::parse();
 
     dotenv().ok();
@@ -455,10 +460,14 @@ async fn main() {
         .await
         .expect("Error creating client");
 
+    panic::set_hook(Box::new(move |p| {
+        error!("{}", p);
+    }));
+
     // Finally, start a single shard, and start listening to events.
     // Shards will automatically attempt to reconnect, and will perform
     // exponential backoff until it reconnects.
     if let Err(why) = client.start().await {
-        println!("Client error: {:?}", why);
+        error!("Client error: {:?}", why);
     }
 }
