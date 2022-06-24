@@ -18,6 +18,7 @@ serenity = { version = "0.11", default-features = false, features = [
     "cache",
     "chrono",
     "client",
+    "collector",
     "gateway",
     "http",
     "model",

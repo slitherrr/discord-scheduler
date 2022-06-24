@@ -13,9 +13,10 @@ use serenity::model::id::{RoleId, UserId};
 use serenity::model::interactions::message_component::{ButtonStyle, MessageComponentInteraction};
 use serenity::model::interactions::InteractionResponseType;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-struct Response {
+pub struct Response {
     dates: HashSet<NaiveDate>,
 }
 
@@ -26,7 +27,6 @@ pub struct Scheduler {
     dates: Vec<NaiveDate>,
     group: Option<RoleId>,
     message: MessageShim,
-    pending_responses: HashMap<UserId, Response>,
     responses: HashMap<UserId, Response>,
     closed: bool,
 }
@@ -58,10 +58,53 @@ impl Scheduler {
             dates,
             group,
             message: message.into(),
-            pending_responses: Default::default(),
             responses: Default::default(),
             closed: false,
         }
+    }
+
+    pub fn get_dates(&self) -> Vec<NaiveDate> {
+        self.dates.clone()
+    }
+
+    pub fn get_user_response(&self, user: &UserId) -> Option<Response> {
+        self.responses.get(user).cloned()
+    }
+
+    pub async fn can_respond(
+        &self,
+        ctx: &Context,
+        component: &MessageComponentInteraction,
+    ) -> bool {
+        match self.group {
+            Some(role) => {
+                let user = &component.user;
+                let guild = component.guild_id.expect("Cannot get guild");
+                let allowed = user
+                    .has_role(&ctx, guild, role)
+                    .await
+                    .expect("Cannot check role");
+                if !allowed {
+                    component
+                        .create_interaction_response(&ctx, |r| {
+                            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                                .interaction_response_data(|m| {
+                                    m.content(format!("Only <@&{}> may respond", role))
+                                        .ephemeral(true)
+                                })
+                        })
+                        .await
+                        .expect("Cannot send response");
+                }
+                allowed
+            }
+            None => true,
+        }
+    }
+
+    pub async fn add_response(&mut self, ctx: &Context, user: UserId, response: Response) {
+        self.responses.insert(user, response);
+        self.update_message(ctx).await;
     }
 
     fn get_responses(&self) -> String {
@@ -168,43 +211,6 @@ impl Scheduler {
             .ok();
     }
 
-    pub async fn send_dm(&mut self, ctx: &Context, component: &MessageComponentInteraction) {
-        let user = &component.user;
-        let guild = component.guild_id.expect("Cannot get guild");
-        if let Some(role) = self.group {
-            if !user
-                .has_role(ctx, guild, role)
-                .await
-                .expect("Cannot check role")
-            {
-                component
-                    .create_interaction_response(ctx, |r| {
-                        r.kind(InteractionResponseType::ChannelMessageWithSource)
-                            .interaction_response_data(|m| {
-                                m.content(format!("Only <@&{}> may respond", role))
-                                    .ephemeral(true)
-                            })
-                    })
-                    .await
-                    .expect("Cannot send response");
-                return;
-            }
-        }
-        self.pending_responses.remove(&user.id);
-        let response = self.responses.get(&user.id).cloned().unwrap_or_default();
-        component
-            .create_interaction_response(ctx, |r| {
-                r.kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|m| {
-                        m.ephemeral(true)
-                            .components(|c| create_dm_buttons(&self.dates, &response, c))
-                    })
-            })
-            .await
-            .expect("Cannot send DM");
-        self.pending_responses.insert(user.id, response);
-    }
-
     pub async fn show_details(&self, ctx: &Context, component: &MessageComponentInteraction) {
         component.defer(ctx).await.unwrap();
         let results = self.get_results(true);
@@ -228,81 +234,7 @@ impl Scheduler {
         }
     }
 
-    async fn update_dm(&self, ctx: &Context, component: &MessageComponentInteraction) {
-        let response = self
-            .pending_responses
-            .get(&component.user.id)
-            .expect("Cannot find response for user");
-        component
-            .edit_original_interaction_response(ctx, |m| {
-                m.components(|c| create_dm_buttons(&self.dates, response, c))
-            })
-            .await
-            .expect("Cannot update DM");
-    }
-
-    pub async fn handle_select(
-        &mut self,
-        ctx: &Context,
-        component: &MessageComponentInteraction,
-        index: usize,
-    ) {
-        let response = self
-            .pending_responses
-            .get_mut(&component.user.id)
-            .expect("Cannot find response for user");
-        let date = &self.dates[index];
-        let dates = &mut response.dates;
-        if dates.contains(date) {
-            dates.remove(date);
-        } else {
-            dates.insert(*date);
-        }
-        self.update_dm(ctx, component).await;
-    }
-
-    pub async fn handle_select_all(
-        &mut self,
-        ctx: &Context,
-        component: &MessageComponentInteraction,
-    ) {
-        let response = self
-            .pending_responses
-            .get_mut(&component.user.id)
-            .expect("Cannot find response for user");
-        response.dates = self.dates.iter().cloned().collect();
-        self.update_dm(ctx, component).await;
-    }
-
-    pub async fn handle_clear_all(
-        &mut self,
-        ctx: &Context,
-        component: &MessageComponentInteraction,
-    ) {
-        let response = self
-            .pending_responses
-            .get_mut(&component.user.id)
-            .expect("Cannot find response for user");
-        response.dates.clear();
-        self.update_dm(ctx, component).await;
-    }
-
-    pub async fn handle_response(&mut self, ctx: &Context, component: MessageComponentInteraction) {
-        let response = self
-            .pending_responses
-            .remove(&component.user.id)
-            .expect("Cannot find pending response for user");
-        self.responses.insert(component.user.id, response);
-        self.update_message(ctx).await;
-        component
-            .edit_original_interaction_response(ctx, |m| {
-                m.content("Response submitted").components(|c| c)
-            })
-            .await
-            .unwrap();
-    }
-
-    pub async fn close_prompt(&self, ctx: &Context, component: MessageComponentInteraction) {
+    pub async fn close_prompt(&self, ctx: &Context, component: &MessageComponentInteraction) {
         if component.user.id != self.owner {
             component
                 .create_interaction_response(ctx, |response| {
@@ -332,7 +264,7 @@ impl Scheduler {
             .expect("Cannot send message");
     }
 
-    pub async fn handle_close(&mut self, ctx: &Context, component: MessageComponentInteraction) {
+    pub async fn handle_close(&mut self, ctx: &Context, component: &MessageComponentInteraction) {
         component
             .defer(ctx)
             .await
@@ -383,20 +315,111 @@ fn create_dm_buttons<'a>(
 
     let mut button = CreateButton::default();
     button.label("Select all");
-    button.custom_id("dm_select_all");
+    button.custom_id("select_all");
     button.style(ButtonStyle::Success);
     ar.add_button(button);
 
     let mut button = CreateButton::default();
     button.label("Clear all");
-    button.custom_id("dm_clear_all");
+    button.custom_id("clear_all");
     button.style(ButtonStyle::Secondary);
     ar.add_button(button);
 
     let mut button = CreateButton::default();
     button.label("Submit");
-    button.custom_id("dm_submit");
+    button.custom_id("submit");
     ar.add_button(button);
 
     components.add_action_row(ar)
+}
+
+// Ephemeral messages can only be edited for a limited time after they are initally created;
+// testing indicates that this limit is 15 minutes
+const RESP_TIMEOUT: std::time::Duration = std::time::Duration::new(60 * 14, 0);
+
+pub async fn get_response(
+    ctx: &Context,
+    component: &MessageComponentInteraction,
+    mut response: Response,
+    dates: Vec<NaiveDate>,
+) -> Option<Response> {
+    component
+        .create_interaction_response(ctx, |r| {
+            r.kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|m| {
+                    m.ephemeral(true)
+                        .components(|c| create_dm_buttons(&dates, &response, c))
+                })
+        })
+        .await
+        .expect("Cannot send DM");
+
+    let expiration = Instant::now() + RESP_TIMEOUT;
+
+    let message = component
+        .get_interaction_response(ctx)
+        .await
+        .expect("Cannot get response message");
+    loop {
+        let interaction = message
+            .await_component_interaction(ctx)
+            .timeout(expiration - Instant::now())
+            .await;
+        let interaction = match interaction {
+            Some(i) => i,
+            None => {
+                component
+                    .edit_original_interaction_response(ctx, |m| {
+                        m.content("Response timed out").components(|c| c)
+                    })
+                    .await
+                    .expect("Cannot update message");
+                return None;
+            }
+        };
+        interaction
+            .defer(ctx)
+            .await
+            .expect("Cannot respond to button");
+        let button_id = interaction.data.custom_id.as_str();
+        match button_id {
+            "submit" => {
+                if matches!(
+                    component
+                        .edit_original_interaction_response(ctx, |m| {
+                            m.content("Response submitted").components(|c| c)
+                        })
+                        .await,
+                    Err(_)
+                ) {
+                    error!("Cannot update message");
+                }
+                return Some(response);
+            }
+            "select_all" => response.dates = dates.iter().cloned().collect(),
+            "clear_all" => response.dates.clear(),
+            _ => {
+                let (button_id, data) = button_id.split_once(' ').unwrap();
+                match button_id {
+                    "select" => {
+                        let index: usize = data.parse().expect("Cannot parse index");
+                        let date = &dates[index];
+                        let resp_dates = &mut response.dates;
+                        if resp_dates.contains(date) {
+                            resp_dates.remove(date);
+                        } else {
+                            resp_dates.insert(*date);
+                        }
+                    }
+                    _ => panic!("Unexpected button: {button_id}"),
+                }
+            }
+        }
+        component
+            .edit_original_interaction_response(ctx, |m| {
+                m.components(|c| create_dm_buttons(&dates, &response, c))
+            })
+            .await
+            .expect("Cannot update message");
+    }
 }

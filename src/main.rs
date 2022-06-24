@@ -206,13 +206,27 @@ impl Handler {
         schedulers.insert(message_id, scheduler);
     }
 
-    async fn handle_add_response(&self, ctx: Context, component: MessageComponentInteraction) {
+    async fn handle_add_response(&self, ctx: Context, component: &MessageComponentInteraction) {
         let message_id = component.message.id;
-        let mut scheduler = self
-            .get_mut_scheduler(message_id)
+        let scheduler = self
+            .get_scheduler(&message_id)
             .await
             .expect("Cannot find scheduler");
-        scheduler.send_dm(&ctx, &component).await;
+        if !scheduler.can_respond(&ctx, component).await {
+            return;
+        }
+        let dates = scheduler.get_dates();
+        let response = scheduler
+            .get_user_response(&component.user.id)
+            .unwrap_or_default();
+        drop(scheduler); // Release the lock so we don't block other interactions
+        if let Some(response) = scheduler::get_response(&ctx, component, response, dates).await {
+            self.get_mut_scheduler(message_id)
+                .await
+                .unwrap()
+                .add_response(&ctx, component.user.id, response)
+                .await;
+        }
     }
 
     async fn handle_show_details(&self, ctx: Context, component: &MessageComponentInteraction) {
@@ -224,26 +238,7 @@ impl Handler {
         scheduler.show_details(&ctx, component).await;
     }
 
-    async fn handle_dm_submit(&self, ctx: Context, component: MessageComponentInteraction) {
-        component
-            .defer(&ctx)
-            .await
-            .expect("Cannot respond to dm button");
-        let scheduler_message = component
-            .message
-            .message_reference
-            .as_ref()
-            .expect("Cannot find message for DM")
-            .message_id
-            .unwrap();
-        let mut scheduler = self
-            .get_mut_scheduler(scheduler_message)
-            .await
-            .expect("Cannot find scheduler");
-        scheduler.handle_response(&ctx, component).await;
-    }
-
-    async fn handle_close(&self, ctx: Context, component: MessageComponentInteraction) {
+    async fn handle_close(&self, ctx: Context, component: &MessageComponentInteraction) {
         let scheduler = self
             .get_scheduler(&component.message.id)
             .await
@@ -251,7 +246,7 @@ impl Handler {
         scheduler.close_prompt(&ctx, component).await;
     }
 
-    async fn handle_close_yes(&self, ctx: Context, component: MessageComponentInteraction) {
+    async fn handle_close_yes(&self, ctx: Context, component: &MessageComponentInteraction) {
         component
             .defer(&ctx)
             .await
@@ -262,69 +257,6 @@ impl Handler {
             .await
             .expect("Cannot find scheduler");
         scheduler.handle_close(&ctx, component).await;
-    }
-
-    async fn handle_dm_select(
-        &self,
-        ctx: Context,
-        component: &MessageComponentInteraction,
-        data: &str,
-    ) {
-        component
-            .defer(&ctx)
-            .await
-            .expect("Cannot respond to dm button");
-        let scheduler_message = component
-            .message
-            .message_reference
-            .as_ref()
-            .expect("Cannot find message for DM")
-            .message_id
-            .unwrap();
-        let mut scheduler = self
-            .get_mut_scheduler(scheduler_message)
-            .await
-            .expect("Cannot find scheduler");
-        let index = data.parse().expect("Cannot parse index");
-        scheduler.handle_select(&ctx, component, index).await;
-    }
-
-    async fn handle_dm_select_all(&self, ctx: Context, component: &MessageComponentInteraction) {
-        component
-            .defer(&ctx)
-            .await
-            .expect("Cannot respond to dm button");
-        let scheduler_message = component
-            .message
-            .message_reference
-            .as_ref()
-            .expect("Cannot find message for DM")
-            .message_id
-            .unwrap();
-        let mut scheduler = self
-            .get_mut_scheduler(scheduler_message)
-            .await
-            .expect("Cannot find scheduler");
-        scheduler.handle_select_all(&ctx, component).await;
-    }
-
-    async fn handle_dm_clear_all(&self, ctx: Context, component: &MessageComponentInteraction) {
-        component
-            .defer(&ctx)
-            .await
-            .expect("Cannot respond to dm button");
-        let scheduler_message = component
-            .message
-            .message_reference
-            .as_ref()
-            .expect("Cannot find message for DM")
-            .message_id
-            .unwrap();
-        let mut scheduler = self
-            .get_mut_scheduler(scheduler_message)
-            .await
-            .expect("Cannot find scheduler");
-        scheduler.handle_clear_all(&ctx, component).await;
     }
 }
 
@@ -346,23 +278,11 @@ impl EventHandler for Handler {
                 let button_id = component.data.custom_id.as_str();
                 info!("{} <{}>", button_id, user);
                 match button_id {
-                    "response" => self.handle_add_response(ctx, component).await,
+                    "response" => self.handle_add_response(ctx, &component).await,
                     "details" => self.handle_show_details(ctx, &component).await,
-                    "dm_submit" => self.handle_dm_submit(ctx, component).await,
-                    "close" => self.handle_close(ctx, component).await,
-                    "close_yes" => self.handle_close_yes(ctx, component).await,
-                    "dm_select_all" => self.handle_dm_select_all(ctx, &component).await,
-                    "dm_clear_all" => self.handle_dm_clear_all(ctx, &component).await,
-                    _ => {
-                        if let Some((button_id, rest)) = button_id.split_once(' ') {
-                            match button_id {
-                                "select" => self.handle_dm_select(ctx, &component, rest).await,
-                                _ => panic!("Unexpected button: {}", button_id),
-                            }
-                        } else {
-                            panic!("Unexpected button: {}", button_id);
-                        }
-                    }
+                    "close" => self.handle_close(ctx, &component).await,
+                    "close_yes" => self.handle_close_yes(ctx, &component).await,
+                    _ => (),
                 }
             }
             _ => panic!("Unexpected interaction: {:?}", interaction),
