@@ -1,6 +1,6 @@
 mod message_shim;
 mod scheduler;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{ResponseType, Scheduler};
 
 use chrono::Weekday;
 use clap::Parser;
@@ -206,8 +206,22 @@ impl Handler {
         schedulers.insert(message_id, scheduler);
     }
 
-    async fn handle_add_response(&self, ctx: Context, component: &MessageComponentInteraction) {
-        let message_id = component.message.id;
+    async fn handle_get_response(
+        &self,
+        ctx: Context,
+        component: &MessageComponentInteraction,
+        resp_type: ResponseType,
+    ) {
+        let message_id = match resp_type {
+            ResponseType::Normal => component.message.id,
+            ResponseType::Blackout => component
+                .message
+                .message_reference
+                .as_ref()
+                .expect("Cannot find message for DM")
+                .message_id
+                .unwrap(),
+        };
         let scheduler = self
             .get_scheduler(&message_id)
             .await
@@ -216,16 +230,27 @@ impl Handler {
             return;
         }
         let dates = scheduler.get_dates();
-        let response = scheduler
-            .get_user_response(&component.user.id)
-            .unwrap_or_default();
+        let blackout_dates = scheduler.get_blackout_dates();
+        let response = match resp_type {
+            ResponseType::Normal => scheduler
+                .get_user_response(&component.user.id)
+                .unwrap_or_default(),
+            ResponseType::Blackout => blackout_dates.clone().into(),
+        };
         drop(scheduler); // Release the lock so we don't block other interactions
-        if let Some(response) = scheduler::get_response(&ctx, component, response, dates).await {
-            self.get_mut_scheduler(message_id)
+        if let Some(response) =
+            scheduler::get_response(&ctx, component, response, dates, blackout_dates, resp_type)
                 .await
-                .unwrap()
-                .add_response(&ctx, component.user.id, response)
-                .await;
+        {
+            let mut scheduler = self.get_mut_scheduler(message_id).await.unwrap();
+            match resp_type {
+                ResponseType::Normal => {
+                    scheduler
+                        .add_response(&ctx, component.user.id, response)
+                        .await
+                }
+                ResponseType::Blackout => scheduler.set_blackout(&ctx, response).await,
+            }
         }
     }
 
@@ -278,7 +303,14 @@ impl EventHandler for Handler {
                 let button_id = component.data.custom_id.as_str();
                 info!("{} <{}>", button_id, user);
                 match button_id {
-                    "response" => self.handle_add_response(ctx, &component).await,
+                    "response" => {
+                        self.handle_get_response(ctx, &component, ResponseType::Normal)
+                            .await
+                    }
+                    "blackout" => {
+                        self.handle_get_response(ctx, &component, ResponseType::Blackout)
+                            .await
+                    }
                     "details" => self.handle_show_details(ctx, &component).await,
                     "close" => self.handle_close(ctx, &component).await,
                     "close_yes" => self.handle_close_yes(ctx, &component).await,

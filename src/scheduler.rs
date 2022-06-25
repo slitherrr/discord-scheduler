@@ -4,7 +4,7 @@ use crate::MAX_WEEKS;
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use chronoutil::DateRule;
 use itertools::Itertools;
-use log::error;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serenity::builder::{CreateActionRow, CreateButton, CreateComponents};
 use serenity::client::Context;
@@ -15,9 +15,21 @@ use serenity::model::interactions::InteractionResponseType;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResponseType {
+    Normal,
+    Blackout,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Response {
     dates: HashSet<NaiveDate>,
+}
+
+impl From<HashSet<NaiveDate>> for Response {
+    fn from(dates: HashSet<NaiveDate>) -> Self {
+        Response { dates }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,6 +37,8 @@ pub struct Scheduler {
     owner: UserId,
     title: String,
     dates: Vec<NaiveDate>,
+    #[serde(default)]
+    blackout_dates: HashSet<NaiveDate>,
     group: Option<RoleId>,
     message: MessageShim,
     responses: HashMap<UserId, Response>,
@@ -56,6 +70,7 @@ impl Scheduler {
             owner,
             title: title.to_string(),
             dates,
+            blackout_dates: Default::default(),
             group,
             message: message.into(),
             responses: Default::default(),
@@ -65,6 +80,10 @@ impl Scheduler {
 
     pub fn get_dates(&self) -> Vec<NaiveDate> {
         self.dates.clone()
+    }
+
+    pub fn get_blackout_dates(&self) -> HashSet<NaiveDate> {
+        self.blackout_dates.clone()
     }
 
     pub fn get_user_response(&self, user: &UserId) -> Option<Response> {
@@ -107,6 +126,11 @@ impl Scheduler {
         self.update_message(ctx).await;
     }
 
+    pub async fn set_blackout(&mut self, ctx: &Context, response: Response) {
+        self.blackout_dates = response.dates;
+        self.update_message(ctx).await;
+    }
+
     fn get_responses(&self) -> String {
         if self.responses.is_empty() {
             "**0**".to_owned()
@@ -124,14 +148,18 @@ impl Scheduler {
     }
 
     fn get_results(&self, detailed: bool) -> impl Iterator<Item = String> + '_ {
-        let results = self.dates.iter().map(|date| {
-            let mut users = HashSet::new();
-            for (user_id, response) in self.responses.iter() {
-                if response.dates.contains(date) {
-                    users.insert(user_id);
+        let results = self.dates.iter().filter_map(|date| {
+            if self.blackout_dates.contains(date) {
+                None
+            } else {
+                let mut users = HashSet::new();
+                for (user_id, response) in self.responses.iter() {
+                    if response.dates.contains(date) {
+                        users.insert(user_id);
+                    }
                 }
+                Some((date, users))
             }
-            (date, users)
         });
         let max = results
             .clone()
@@ -225,13 +253,24 @@ impl Scheduler {
             content += &line;
             content.push('\n');
         }
-        messages.push(content);
+        let last_content = content;
         for content in messages {
             component
                 .create_followup_message(ctx, |m| m.ephemeral(true).content(content))
                 .await
                 .expect("Cannot send message");
         }
+        component
+            .create_followup_message(ctx, |m| {
+                if component.user.id == self.owner {
+                    let mut ar = CreateActionRow::default();
+                    ar.create_button(|b| b.label("Add blackout dates").custom_id("blackout"));
+                    m.components(|c| c.add_action_row(ar));
+                }
+                m.ephemeral(true).content(last_content)
+            })
+            .await
+            .expect("Cannot send message");
     }
 
     pub async fn close_prompt(&self, ctx: &Context, component: &MessageComponentInteraction) {
@@ -284,8 +323,10 @@ impl Scheduler {
 
 fn create_dm_buttons<'a>(
     dates: &Vec<NaiveDate>,
+    blackout_dates: &HashSet<NaiveDate>,
     response: &Response,
     components: &'a mut CreateComponents,
+    resp_type: ResponseType,
 ) -> &'a mut CreateComponents {
     let count = dates.len();
     if count > 2 * MAX_WEEKS {
@@ -302,28 +343,46 @@ fn create_dm_buttons<'a>(
         let mut button = CreateButton::default();
         button.label(date.format("%a %b %d"));
         button.custom_id(format!("select {}", i));
-        button.style(if response.dates.contains(date) {
-            ButtonStyle::Success
-        } else {
-            ButtonStyle::Secondary
-        });
+        match resp_type {
+            ResponseType::Normal => {
+                if blackout_dates.contains(date) {
+                    button.style(ButtonStyle::Danger);
+                    button.disabled(true);
+                } else {
+                    button.style(if response.dates.contains(date) {
+                        ButtonStyle::Success
+                    } else {
+                        ButtonStyle::Secondary
+                    });
+                }
+            }
+            ResponseType::Blackout => {
+                button.style(if response.dates.contains(date) {
+                    ButtonStyle::Danger
+                } else {
+                    ButtonStyle::Secondary
+                });
+            }
+        }
         ar.add_button(button);
     }
     components.add_action_row(ar);
 
     ar = CreateActionRow::default();
 
-    let mut button = CreateButton::default();
-    button.label("Select all");
-    button.custom_id("select_all");
-    button.style(ButtonStyle::Success);
-    ar.add_button(button);
+    if resp_type == ResponseType::Blackout {
+        let mut button = CreateButton::default();
+        button.label("Select all");
+        button.custom_id("select_all");
+        button.style(ButtonStyle::Success);
+        ar.add_button(button);
 
-    let mut button = CreateButton::default();
-    button.label("Clear all");
-    button.custom_id("clear_all");
-    button.style(ButtonStyle::Secondary);
-    ar.add_button(button);
+        let mut button = CreateButton::default();
+        button.label("Clear all");
+        button.custom_id("clear_all");
+        button.style(ButtonStyle::Secondary);
+        ar.add_button(button);
+    }
 
     let mut button = CreateButton::default();
     button.label("Submit");
@@ -342,13 +401,16 @@ pub async fn get_response(
     component: &MessageComponentInteraction,
     mut response: Response,
     dates: Vec<NaiveDate>,
+    blackout_dates: HashSet<NaiveDate>,
+    resp_type: ResponseType,
 ) -> Option<Response> {
     component
         .create_interaction_response(ctx, |r| {
             r.kind(InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|m| {
-                    m.ephemeral(true)
-                        .components(|c| create_dm_buttons(&dates, &response, c))
+                    m.ephemeral(true).components(|c| {
+                        create_dm_buttons(&dates, &blackout_dates, &response, c, resp_type)
+                    })
                 })
         })
         .await
@@ -368,6 +430,7 @@ pub async fn get_response(
         let interaction = match interaction {
             Some(i) => i,
             None => {
+                info!("Response timed out");
                 component
                     .edit_original_interaction_response(ctx, |m| {
                         m.content("Response timed out").components(|c| c)
@@ -396,7 +459,13 @@ pub async fn get_response(
                 }
                 return Some(response);
             }
-            "select_all" => response.dates = dates.iter().cloned().collect(),
+            "select_all" => {
+                response.dates = dates
+                    .iter()
+                    .filter(|d| !blackout_dates.contains(d))
+                    .cloned()
+                    .collect()
+            }
             "clear_all" => response.dates.clear(),
             _ => {
                 let (button_id, data) = button_id.split_once(' ').unwrap();
@@ -417,7 +486,9 @@ pub async fn get_response(
         }
         component
             .edit_original_interaction_response(ctx, |m| {
-                m.components(|c| create_dm_buttons(&dates, &response, c))
+                m.components(|c| {
+                    create_dm_buttons(&dates, &blackout_dates, &response, c, resp_type)
+                })
             })
             .await
             .expect("Cannot update message");
