@@ -19,6 +19,7 @@ use std::time::Instant;
 pub enum ResponseType {
     Normal,
     Blackout,
+    CreateEvent,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ pub struct Scheduler {
     dates: Vec<NaiveDate>,
     #[serde(default)]
     blackout_dates: HashSet<NaiveDate>,
+    event_dates: HashSet<NaiveDate>,
     group: Option<RoleId>,
     message: MessageShim,
     responses: HashMap<UserId, Response>,
@@ -71,6 +73,7 @@ impl Scheduler {
             title: title.to_string(),
             dates,
             blackout_dates: Default::default(),
+            event_dates: Default::default(),
             group,
             message: message.into(),
             responses: Default::default(),
@@ -84,6 +87,10 @@ impl Scheduler {
 
     pub fn get_blackout_dates(&self) -> HashSet<NaiveDate> {
         self.blackout_dates.clone()
+    }
+
+    pub fn get_event_dates(&self) -> HashSet<NaiveDate> {
+        self.event_dates.clone()
     }
 
     pub fn get_user_response(&self, user: &UserId) -> Option<Response> {
@@ -128,6 +135,11 @@ impl Scheduler {
 
     pub async fn set_blackout(&mut self, ctx: &Context, response: Response) {
         self.blackout_dates = response.dates;
+        self.update_message(ctx).await;
+    }
+
+    pub async fn set_events_and_update_to_match(&mut self, ctx: &Context, response: Response) {
+        self.event_dates = response.dates;
         self.update_message(ctx).await;
     }
 
@@ -265,6 +277,7 @@ impl Scheduler {
                 if component.user.id == self.owner {
                     let mut ar = CreateActionRow::default();
                     ar.create_button(|b| b.label("Add blackout dates").custom_id("blackout"));
+                    ar.create_button(|b| b.label("Create event").custom_id("create_event"));
                     m.components(|c| c.add_action_row(ar));
                 }
                 m.ephemeral(true).content(last_content)
@@ -324,6 +337,7 @@ impl Scheduler {
 fn create_dm_buttons<'a>(
     dates: &Vec<NaiveDate>,
     blackout_dates: &HashSet<NaiveDate>,
+    event_dates: &HashSet<NaiveDate>,
     response: &Response,
     components: &'a mut CreateComponents,
     resp_type: ResponseType,
@@ -363,9 +377,20 @@ fn create_dm_buttons<'a>(
                     ButtonStyle::Secondary
                 });
             }
+            ResponseType::CreateEvent => {
+                if  blackout_dates.contains(date) {
+                    button.style(ButtonStyle::Danger);
+                    button.disabled(true);
+                } else if event_dates.contains(date) {
+                    button.style(ButtonStyle::Success);
+                } else {
+                    button.style(ButtonStyle::Secondary);
+                }
+            }
         }
         ar.add_button(button);
     }
+
     components.add_action_row(ar);
 
     ar = CreateActionRow::default();
@@ -402,6 +427,7 @@ pub async fn get_response(
     mut response: Response,
     dates: Vec<NaiveDate>,
     blackout_dates: HashSet<NaiveDate>,
+    event_dates: HashSet<NaiveDate>,
     resp_type: ResponseType,
 ) -> Option<Response> {
     component
@@ -409,7 +435,7 @@ pub async fn get_response(
             r.kind(InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|m| {
                     m.ephemeral(true).components(|c| {
-                        create_dm_buttons(&dates, &blackout_dates, &response, c, resp_type)
+                        create_dm_buttons(&dates, &blackout_dates, &response, &event_dates, c, resp_type)
                     })
                 })
         })

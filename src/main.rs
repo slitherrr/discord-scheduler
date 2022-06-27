@@ -214,7 +214,7 @@ impl Handler {
     ) {
         let message_id = match resp_type {
             ResponseType::Normal => component.message.id,
-            ResponseType::Blackout => component
+            ResponseType::Blackout | ResponseType::CreateEvent => component
                 .message
                 .message_reference
                 .as_ref()
@@ -231,15 +231,18 @@ impl Handler {
         }
         let dates = scheduler.get_dates();
         let blackout_dates = scheduler.get_blackout_dates();
+        let event_dates = scheduler.get_event_dates();
         let response = match resp_type {
             ResponseType::Normal => scheduler
                 .get_user_response(&component.user.id)
                 .unwrap_or_default(),
             ResponseType::Blackout => blackout_dates.clone().into(),
+            ResponseType::CreateEvent => event_dates.clone().into(),
         };
         drop(scheduler); // Release the lock so we don't block other interactions
+        // TODO: Actually make the event in here somewhere
         if let Some(response) =
-            scheduler::get_response(&ctx, component, response, dates, blackout_dates, resp_type)
+            scheduler::get_response(&ctx, component, response, dates, blackout_dates, event_dates, resp_type)
                 .await
         {
             let mut scheduler = self.get_mut_scheduler(message_id).await.unwrap();
@@ -250,6 +253,7 @@ impl Handler {
                         .await
                 }
                 ResponseType::Blackout => scheduler.set_blackout(&ctx, response).await,
+                ResponseType::CreateEvent => scheduler.set_events_and_update_to_match(&ctx, response).await,
             }
         }
     }
@@ -309,6 +313,10 @@ impl EventHandler for Handler {
                     }
                     "blackout" => {
                         self.handle_get_response(ctx, &component, ResponseType::Blackout)
+                            .await
+                    }
+                    "create_event" => {
+                        self.handle_get_response(ctx, &component, ResponseType::CreateEvent)
                             .await
                     }
                     "details" => self.handle_show_details(ctx, &component).await,
