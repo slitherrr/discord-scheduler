@@ -5,6 +5,7 @@ use crate::scheduler::{ResponseType, Scheduler};
 use chrono::Weekday;
 use clap::Parser;
 use dotenv::dotenv;
+use lockfree::map::Map;
 use log::{error, info};
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
@@ -20,46 +21,17 @@ use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::ops::{Deref, DerefMut};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tokio::sync::{RwLock, RwLockMappedWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 
 const DATA_DIR: &str = "data";
 const MAX_WEEKS: usize = 10;
 
-// All mutable accesses to Handler.schedulers go through this wrapper, which dumps the data to disk
-// when it is dropped.
-struct ScheduleWrapper<'a> {
-    message_id: MessageId,
-    scheduler: RwLockMappedWriteGuard<'a, Scheduler>,
-}
-
-impl<'a> Deref for ScheduleWrapper<'a> {
-    type Target = Scheduler;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.scheduler
-    }
-}
-
-impl<'a> DerefMut for ScheduleWrapper<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.scheduler
-    }
-}
-
-impl<'a> Drop for ScheduleWrapper<'a> {
-    fn drop(&mut self) {
-        write_file(&self.message_id, self);
-    }
-}
-
 #[derive(Default)]
 struct Handler {
     refresh: bool,
-    schedulers: RwLock<HashMap<MessageId, Scheduler>>,
+    schedulers: Map<MessageId, Scheduler>,
 }
 
 async fn send_error(ctx: &Context, command: &ApplicationCommandInteraction, msg: &str) {
@@ -118,36 +90,21 @@ impl Handler {
             std::fs::create_dir(DATA_DIR).expect("Cannot create data dir");
         }
 
-        let mut schedulers: HashMap<MessageId, Scheduler> = HashMap::default();
+        let schedulers: Map<MessageId, Scheduler> = Map::new();
+        let mut count = 0;
         for f in std::fs::read_dir(DATA_DIR).expect("Cannot read data dir") {
             let path = f.unwrap().path();
             if let Some((id, s)) = read_file(&path) {
                 schedulers.insert(id.into(), s);
+                count += 1;
             }
         }
-        info!("{} schedulers loaded", schedulers.len());
+        info!("{} schedulers loaded", count);
 
         Handler {
             refresh,
-            schedulers: RwLock::new(schedulers),
+            schedulers,
         }
-    }
-
-    async fn get_scheduler(
-        &self,
-        message_id: &MessageId,
-    ) -> Option<RwLockReadGuard<'_, Scheduler>> {
-        let schedulers = self.schedulers.read().await;
-        RwLockReadGuard::try_map(schedulers, |s| s.get(message_id)).ok()
-    }
-
-    async fn get_mut_scheduler(&self, message_id: MessageId) -> Option<ScheduleWrapper<'_>> {
-        let schedulers = self.schedulers.write().await;
-        let scheduler = RwLockWriteGuard::try_map(schedulers, |s| s.get_mut(&message_id)).ok()?;
-        Some(ScheduleWrapper {
-            message_id,
-            scheduler,
-        })
     }
 
     async fn create_scheduler(&self, ctx: Context, command: ApplicationCommandInteraction) {
@@ -201,9 +158,8 @@ impl Handler {
         let message_id = message.id;
         let scheduler = Scheduler::new(command.user.id, group, message, weeks, skip, title, days);
         scheduler.update_message(&ctx).await;
-        let mut schedulers = self.schedulers.write().await;
         write_file(&message_id, &scheduler);
-        schedulers.insert(message_id, scheduler);
+        self.schedulers.insert(message_id, scheduler);
     }
 
     async fn handle_get_response(
@@ -223,65 +179,22 @@ impl Handler {
                 .unwrap(),
         };
         let scheduler = self
-            .get_scheduler(&message_id)
-            .await
+            .schedulers
+            .get(&message_id)
             .expect("Cannot find scheduler");
-        if !scheduler.can_respond(&ctx, component).await {
-            return;
-        }
-        let dates = scheduler.get_dates();
-        let blackout_dates = scheduler.get_blackout_dates();
-        let response = match resp_type {
-            ResponseType::Normal => scheduler
-                .get_user_response(&component.user.id)
-                .unwrap_or_default(),
-            ResponseType::Blackout => blackout_dates.clone().into(),
-        };
-        drop(scheduler); // Release the lock so we don't block other interactions
-        if let Some(response) =
-            scheduler::get_response(&ctx, component, response, dates, blackout_dates, resp_type)
-                .await
-        {
-            let mut scheduler = self.get_mut_scheduler(message_id).await.unwrap();
-            match resp_type {
-                ResponseType::Normal => {
-                    scheduler
-                        .add_response(&ctx, component.user.id, response)
-                        .await
-                }
-                ResponseType::Blackout => scheduler.set_blackout(&ctx, response).await,
-            }
-        }
+        scheduler
+            .val()
+            .get_response(&ctx, component, resp_type)
+            .await
     }
 
     async fn handle_show_details(&self, ctx: Context, component: &MessageComponentInteraction) {
         let message_id = component.message.id;
         let scheduler = self
-            .get_scheduler(&message_id)
-            .await
+            .schedulers
+            .get(&message_id)
             .expect("Cannot find scheduler");
-        scheduler.show_details(&ctx, component).await;
-    }
-
-    async fn handle_close(&self, ctx: Context, component: &MessageComponentInteraction) {
-        let scheduler = self
-            .get_scheduler(&component.message.id)
-            .await
-            .expect("Cannot find scheduler");
-        scheduler.close_prompt(&ctx, component).await;
-    }
-
-    async fn handle_close_yes(&self, ctx: Context, component: &MessageComponentInteraction) {
-        component
-            .defer(&ctx)
-            .await
-            .expect("Cannot respond to button");
-        let message_ref = component.message.message_reference.as_ref().unwrap();
-        let mut scheduler = self
-            .get_mut_scheduler(message_ref.message_id.unwrap())
-            .await
-            .expect("Cannot find scheduler");
-        scheduler.handle_close(&ctx, component).await;
+        scheduler.val().show_details(&ctx, component).await;
     }
 }
 
@@ -312,8 +225,6 @@ impl EventHandler for Handler {
                             .await
                     }
                     "details" => self.handle_show_details(ctx, &component).await,
-                    "close" => self.handle_close(ctx, &component).await,
-                    "close_yes" => self.handle_close_yes(ctx, &component).await,
                     _ => (),
                 }
             }
@@ -365,7 +276,8 @@ impl EventHandler for Handler {
         .expect("Cannot create command");
 
         if self.refresh {
-            for (_, scheduler) in self.schedulers.read().await.iter() {
+            for entry in self.schedulers.iter() {
+                let scheduler = entry.val();
                 scheduler.update_message(&ctx).await;
             }
         }
@@ -378,8 +290,7 @@ impl EventHandler for Handler {
         deleted_message_id: MessageId,
         _guild_id: Option<GuildId>,
     ) {
-        let mut schedulers = self.schedulers.write().await;
-        if let Some(_scheduler) = schedulers.remove(&deleted_message_id) {
+        if let Some(_scheduler) = self.schedulers.remove(&deleted_message_id) {
             info!("scheduler message deleted: {}", deleted_message_id);
             delete_file(&deleted_message_id);
         }

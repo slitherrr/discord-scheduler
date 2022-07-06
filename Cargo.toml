@@ -7,6 +7,7 @@ edition = "2021"
 chrono = "0.4"
 chronoutil = "0.2"
 clap = { version = "3.2", features = ["derive"] }
+lockfree = "0.5"
 dotenv = { version = "0.15.0" }
 env_logger = "0.9"
 itertools = "0.10"

@@ -9,7 +9,7 @@ use serenity::model::id::{ChannelId, MessageId};
 /// Lightweight version of [`serenity::model::channel::Message`] that only supports [`edit`](MessageShim::edit)
 #[derive(Serialize, Deserialize)]
 pub struct MessageShim {
-    message_id: MessageId,
+    pub message_id: MessageId,
     channel_id: ChannelId,
 }
 
