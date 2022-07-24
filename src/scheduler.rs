@@ -395,7 +395,7 @@ impl Scheduler {
         let mut menu = CreateSelectMenu::default();
         menu.custom_id("select");
         menu.min_values(1);
-        menu.max_values(MAX_WEEKS as u64);
+        menu.max_values(count as u64);
         menu.options(|f| {
             let menu_options: Vec<CreateSelectMenuOption> = self
                 .dates
@@ -407,7 +407,7 @@ impl Scheduler {
                             None
                         } else {
                             let mut opt = CreateSelectMenuOption::default();
-                            opt.label(date.format("%a %b %d"));
+                            opt.label(date.format("%A %B %d"));
                             opt.value(format!("{}", i));
                             opt.default_selection(response.dates.contains(date));
 
