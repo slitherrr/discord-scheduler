@@ -6,7 +6,9 @@ use chronoutil::DateRule;
 use itertools::Itertools;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use serenity::builder::{CreateActionRow, CreateButton, CreateComponents};
+use serenity::builder::{
+    CreateActionRow, CreateButton, CreateComponents, CreateSelectMenu, CreateSelectMenuOption,
+};
 use serenity::client::Context;
 use serenity::model::channel::Message;
 use serenity::model::id::{RoleId, UserId};
@@ -324,8 +326,8 @@ impl Scheduler {
                 .defer(ctx)
                 .await
                 .expect("Cannot respond to button");
-            let button_id = interaction.data.custom_id.as_str();
-            match button_id {
+            let interaction_id = interaction.data.custom_id.as_str();
+            match interaction_id {
                 "submit" => {
                     if matches!(
                         component
@@ -349,22 +351,21 @@ impl Scheduler {
                         .collect()
                 }
                 "clear_all" => response.dates.clear(),
-                _ => {
-                    let (button_id, data) = button_id.split_once(' ').unwrap();
-                    match button_id {
-                        "select" => {
-                            let index: usize = data.parse().expect("Cannot parse index");
-                            let date = &self.dates[index];
-                            let resp_dates = &mut response.dates;
-                            if resp_dates.contains(date) {
-                                resp_dates.remove(date);
-                            } else {
-                                resp_dates.insert(*date);
-                            }
-                        }
-                        _ => panic!("Unexpected button: {button_id}"),
+                "select" => {
+                    let selections: Vec<usize> = interaction
+                        .data
+                        .values
+                        .iter()
+                        .map(|v| v.parse().unwrap())
+                        .collect();
+                    response.dates.clear();
+                    for index in selections.iter() {
+                        let date = &self.dates[*index];
+                        let resp_dates = &mut response.dates;
+                        resp_dates.insert(*date);
                     }
                 }
+                _ => panic!("Unexpected button: {interaction_id}"),
             }
             component
                 .edit_original_interaction_response(ctx, |m| {
@@ -390,40 +391,42 @@ impl Scheduler {
         if count > 2 * MAX_WEEKS {
             panic!("Too many dates!");
         }
-        let per_row = std::cmp::max(2, (count as f32 / 4f32).ceil() as usize);
-
         let mut ar = CreateActionRow::default();
-        for (i, date) in self.dates.iter().enumerate() {
-            if i > 0 && i % per_row == 0 {
-                components.add_action_row(ar);
-                ar = CreateActionRow::default();
-            }
-            let mut button = CreateButton::default();
-            button.label(date.format("%a %b %d"));
-            button.custom_id(format!("select {}", i));
-            match resp_type {
-                ResponseType::Normal => {
-                    if self.blackout_dates.read().unwrap().contains(date) {
-                        button.style(ButtonStyle::Danger);
-                        button.disabled(true);
-                    } else {
-                        button.style(if response.dates.contains(date) {
-                            ButtonStyle::Success
+        let mut menu = CreateSelectMenu::default();
+        menu.custom_id("select");
+        menu.min_values(1);
+        menu.max_values(MAX_WEEKS as u64);
+        menu.options(|f| {
+            let menu_options: Vec<CreateSelectMenuOption> = self
+                .dates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, date)| match resp_type {
+                    ResponseType::Normal => {
+                        if self.blackout_dates.read().unwrap().contains(date) {
+                            None
                         } else {
-                            ButtonStyle::Secondary
-                        });
+                            let mut opt = CreateSelectMenuOption::default();
+                            opt.label(date.format("%a %b %d"));
+                            opt.value(format!("{}", i));
+                            opt.default_selection(response.dates.contains(date));
+
+                            Some(opt)
+                        }
                     }
-                }
-                ResponseType::Blackout => {
-                    button.style(if response.dates.contains(date) {
-                        ButtonStyle::Danger
-                    } else {
-                        ButtonStyle::Secondary
-                    });
-                }
-            }
-            ar.add_button(button);
-        }
+                    ResponseType::Blackout => {
+                        let mut opt = CreateSelectMenuOption::default();
+                        opt.label(date.format("%a %b %d"));
+                        opt.value(format!("{}", i));
+                        opt.default_selection(self.blackout_dates.read().unwrap().contains(date));
+
+                        Some(opt)
+                    }
+                })
+                .collect();
+            f.set_options(menu_options)
+        });
+        ar.add_select_menu(menu);
         components.add_action_row(ar);
 
         ar = CreateActionRow::default();
