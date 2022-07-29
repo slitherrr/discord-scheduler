@@ -413,7 +413,6 @@ impl Scheduler {
                         } else {
                             let mut opt = CreateSelectMenuOption::default();
                             opt.label(date.format("%a %b %d"));
-                            opt.description(date.format("%A %B %d"));
                             opt.value(format!("{}", i));
                             opt.default_selection(response.dates.contains(date));
 
