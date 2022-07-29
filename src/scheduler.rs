@@ -388,14 +388,19 @@ impl Scheduler {
         resp_type: ResponseType,
     ) -> &'a mut CreateComponents {
         let count = self.dates.len();
+        let blackout_count = self.blackout_dates.read().unwrap().len();
+        let select_max = match resp_type {
+            ResponseType::Normal => count - blackout_count,
+            ResponseType::Blackout => count,
+        } as u64;
         if count > 2 * MAX_WEEKS {
             panic!("Too many dates!");
         }
         let mut ar = CreateActionRow::default();
         let mut menu = CreateSelectMenu::default();
         menu.custom_id("select");
-        menu.min_values(1);
-        menu.max_values(count as u64);
+        menu.min_values(0);
+        menu.max_values(select_max);
         menu.options(|f| {
             let menu_options: Vec<CreateSelectMenuOption> = self
                 .dates
@@ -408,6 +413,7 @@ impl Scheduler {
                         } else {
                             let mut opt = CreateSelectMenuOption::default();
                             opt.label(date.format("%A %B %d"));
+                            opt.description("%v");
                             opt.value(format!("{}", i));
                             opt.default_selection(response.dates.contains(date));
 
@@ -418,7 +424,7 @@ impl Scheduler {
                         let mut opt = CreateSelectMenuOption::default();
                         opt.label(date.format("%a %b %d"));
                         opt.value(format!("{}", i));
-                        opt.default_selection(self.blackout_dates.read().unwrap().contains(date));
+                        opt.default_selection(response.dates.contains(date));
 
                         Some(opt)
                     }
