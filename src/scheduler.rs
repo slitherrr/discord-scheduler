@@ -1,14 +1,11 @@
 use crate::message_shim::MessageShim;
-use crate::MAX_WEEKS;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use chronoutil::DateRule;
 use itertools::Itertools;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use serenity::builder::{
-    CreateActionRow, CreateButton, CreateComponents, CreateSelectMenu, CreateSelectMenuOption,
-};
+use serenity::builder::{CreateActionRow, CreateButton, CreateComponents, CreateSelectMenu};
 use serenity::client::Context;
 use serenity::model::channel::Message;
 use serenity::model::id::{RoleId, UserId};
@@ -387,50 +384,29 @@ impl Scheduler {
         components: &'a mut CreateComponents,
         resp_type: ResponseType,
     ) -> &'a mut CreateComponents {
-        let count = self.dates.len();
-        let blackout_count = self.blackout_dates.read().unwrap().len();
-        let select_max = match resp_type {
-            ResponseType::Normal => count - blackout_count,
-            ResponseType::Blackout => count,
-        } as u64;
-        if count > 2 * MAX_WEEKS {
-            panic!("Too many dates!");
-        }
         let mut ar = CreateActionRow::default();
         let mut menu = CreateSelectMenu::default();
+        let mut count = 0;
+        menu.options(|m| {
+            for (i, date) in self.dates.iter().enumerate() {
+                if resp_type == ResponseType::Normal
+                    && self.blackout_dates.read().unwrap().contains(date)
+                {
+                    continue;
+                }
+                m.create_option(|opt| {
+                    count += 1;
+                    opt.label(date.format("%a %b %d"));
+                    opt.value(format!("{}", i));
+                    opt.default_selection(response.dates.contains(date));
+                    opt
+                });
+            }
+            m
+        });
         menu.custom_id("select");
         menu.min_values(0);
-        menu.max_values(select_max);
-        menu.options(|f| {
-            let menu_options: Vec<CreateSelectMenuOption> = self
-                .dates
-                .iter()
-                .enumerate()
-                .filter_map(|(i, date)| match resp_type {
-                    ResponseType::Normal => {
-                        if self.blackout_dates.read().unwrap().contains(date) {
-                            None
-                        } else {
-                            let mut opt = CreateSelectMenuOption::default();
-                            opt.label(date.format("%a %b %d"));
-                            opt.value(format!("{}", i));
-                            opt.default_selection(response.dates.contains(date));
-
-                            Some(opt)
-                        }
-                    }
-                    ResponseType::Blackout => {
-                        let mut opt = CreateSelectMenuOption::default();
-                        opt.label(date.format("%a %b %d"));
-                        opt.value(format!("{}", i));
-                        opt.default_selection(response.dates.contains(date));
-
-                        Some(opt)
-                    }
-                })
-                .collect();
-            f.set_options(menu_options)
-        });
+        menu.max_values(count);
         ar.add_select_menu(menu);
         components.add_action_row(ar);
 
